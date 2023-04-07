@@ -11,6 +11,8 @@
 //! ----|--------|--------
 //! `device_id` | Device ID as per the output of `kdeconnect --list-devices`. | Chooses the first found device, if any.
 //! `format` | A string to customise the output of this block. See below for available placeholders. | <code>" $icon $name{ $bat_icon $bat_charge&vert;}{ $notif_icon&vert;} "</code>
+//! `format_disconnected` | Same as `format` but when device is disconnected | `""`
+//! `format_missing` | Same as `format` but when device does not exist | `""`
 //! `bat_info` | Min battery level below which state is set to info. | `60`
 //! `bat_good` | Min battery level below which state is set to good. | `60`
 //! `bat_warning` | Min battery level below which state is set to warning. | `30`
@@ -25,7 +27,6 @@
 //! `notif_icon`  | Only when connected and there are notifications                          | Icon   | -
 //! `notif_count` | Number of notifications on your phone (only when connected and non-zero) | Number | -
 //! `name`        | Name of your device as reported by KDEConnect (if available)             | Text   | -
-//! `connected`   | Present if your device is connected                                      | Flag   | -
 //!
 //! # Example
 //!
@@ -45,16 +46,19 @@
 //! - `phone`
 //! - `phone_disconnected`
 
-use tokio::sync::mpsc;
 use zbus::dbus_proxy;
 
 use super::prelude::*;
+
+make_log_macro!(debug, "kdeconnect");
 
 #[derive(Deserialize, Debug, SmartDefault)]
 #[serde(default)]
 pub struct Config {
     device_id: Option<String>,
     format: FormatConfig,
+    disconnected_format: FormatConfig,
+    missing_format: FormatConfig,
     #[default(60)]
     bat_good: u8,
     #[default(60)]
@@ -63,14 +67,16 @@ pub struct Config {
     bat_warning: u8,
     #[default(15)]
     bat_critical: u8,
-    #[default(true)]
-    hide_disconnected: bool,
 }
 
 pub async fn run(config: Config, mut api: CommonApi) -> Result<()> {
+    api.event_receiver.close();
+
     let format = config
         .format
         .with_default(" $icon $name{ $bat_icon $bat_charge|}{ $notif_icon|} ")?;
+    let disconnected_format = config.disconnected_format.with_default("")?;
+    let missing_format = config.missing_format.with_default("")?;
 
     let battery_state = (
         config.bat_good,
@@ -79,43 +85,32 @@ pub async fn run(config: Config, mut api: CommonApi) -> Result<()> {
         config.bat_critical,
     ) != (0, 0, 0, 0);
 
-    let dbus_conn = new_dbus_connection().await?;
-    let id = match config.device_id {
-        Some(id) => id,
-        None => api.recoverable(|| any_device_id(&dbus_conn)).await?,
-    };
-
-    let (tx, mut rx) = mpsc::channel(8);
-    let device = Device::new(&dbus_conn, tx, &id).await?;
+    let mut monitor = DeviceMonitor::new(config.device_id).await?;
 
     loop {
-        let connected = device.connected().await;
+        match monitor.get_device_info().await {
+            Some(info) => {
+                let mut widget = Widget::new();
 
-        if connected || !config.hide_disconnected {
-            let mut widget = Widget::new().with_format(format.clone());
+                let mut values = map! {
+                    [if info.connected] "icon" => Value::icon(api.get_icon("phone")?),
+                    [if !info.connected] "icon" => Value::icon(api.get_icon("phone_disconnected")?),
+                    [if let Some(name) = info.name] "name" => Value::text(name),
+                    [if info.notifications > 0] "notif_count" => Value::number(info.notifications),
+                    [if info.notifications > 0] "notif_icon" => Value::icon(api.get_icon("notification")?),
+                    [if let Some(bat) = info.bat_level] "bat_charge" => Value::percents(bat),
+                };
 
-            let mut values = map!();
-
-            if let Some(name) = device.name().await {
-                values.insert("name".into(), Value::text(name));
-            }
-
-            if connected {
-                values.insert("icon".into(), Value::icon(api.get_icon("phone")?));
-                values.insert("connected".into(), Value::flag());
-
-                let (level, charging) = device.battery().await;
-                if let Some(level) = level {
-                    values.insert("bat_charge".into(), Value::percents(level));
+                if let Some(level) = info.bat_level {
                     values.insert(
                         "bat_icon".into(),
                         Value::icon(api.get_icon_in_progression(
-                            if charging { "bat_charging" } else { "bat" },
+                            if info.charging { "bat_charging" } else { "bat" },
                             level as f64 / 100.0,
                         )?),
                     );
                     if battery_state {
-                        widget.state = if charging {
+                        widget.state = if info.charging {
                             State::Good
                         } else if level <= config.bat_critical {
                             State::Critical
@@ -129,105 +124,232 @@ pub async fn run(config: Config, mut api: CommonApi) -> Result<()> {
                     }
                 }
 
-                let notif_count = device.notifications().await.unwrap_or(0);
-                if notif_count > 0 {
-                    values.insert("notif_count".into(), Value::number(notif_count));
-                    values.insert(
-                        "notif_icon".into(),
-                        Value::icon(api.get_icon("notification")?),
-                    );
+                if info.connected {
+                    widget.set_format(format.clone());
+                } else {
+                    widget.set_format(disconnected_format.clone());
                 }
+
                 if !battery_state {
-                    widget.state = if notif_count == 0 {
+                    widget.state = if info.notifications == 0 {
                         State::Idle
                     } else {
                         State::Info
                     };
                 }
-            } else {
-                values.insert(
-                    "icon".into(),
-                    Value::icon(api.get_icon("phone_disconnected")?),
-                );
+
+                widget.set_values(values);
+                api.set_widget(widget).await?;
             }
-
-            widget.set_values(values);
-            api.set_widget(widget).await?;
-        } else {
-            api.hide().await?;
-        }
-
-        loop {
-            select! {
-                _ = rx.recv() => break,
-                _ = api.event() => (),
+            None => {
+                let mut widget = Widget::new().with_format(missing_format.clone());
+                widget.set_values(map! {
+                    "icon" => Value::icon(api.get_icon("phone_disconnected")?),
+                });
+                api.set_widget(widget).await?;
             }
         }
+
+        monitor.wait_for_change().await?;
     }
 }
 
+struct DeviceMonitor {
+    device_id: Option<String>,
+    daemon_proxy: DaemonDbusProxy<'static>,
+    device: Option<Device>,
+}
+
 struct Device {
+    id: String,
     device_proxy: DeviceDbusProxy<'static>,
     battery_proxy: BatteryDbusProxy<'static>,
     notifications_proxy: NotificationsDbusProxy<'static>,
+    device_signals: zbus::SignalStream<'static>,
+    notifications_signals: zbus::SignalStream<'static>,
+    battery_refreshed: refreshedStream<'static>,
+}
+
+struct DeviceInfo {
+    connected: bool,
+    name: Option<String>,
+    notifications: usize,
+    charging: bool,
+    bat_level: Option<u8>,
+}
+
+impl DeviceMonitor {
+    async fn new(device_id: Option<String>) -> Result<Self> {
+        let dbus_conn = new_dbus_connection().await?;
+        let daemon_proxy = DaemonDbusProxy::new(&dbus_conn)
+            .await
+            .error("Failed to create DaemonDbusProxy")?;
+        let device = Device::try_find(&daemon_proxy, device_id.as_deref()).await?;
+        Ok(Self {
+            device_id,
+            daemon_proxy,
+            device,
+        })
+    }
+
+    async fn wait_for_change(&mut self) -> Result<()> {
+        match &mut self.device {
+            None => {
+                let mut device_added = self
+                    .daemon_proxy
+                    .receive_device_added()
+                    .await
+                    .error("Couldn't create stream")?;
+                loop {
+                    device_added
+                        .next()
+                        .await
+                        .error("Stream ended unexpectedly")?;
+                    if let Some(device) =
+                        Device::try_find(&self.daemon_proxy, self.device_id.as_deref()).await?
+                    {
+                        self.device = Some(device);
+                        return Ok(());
+                    }
+                }
+            }
+            Some(dev) => {
+                let mut device_removed = self
+                    .daemon_proxy
+                    .receive_device_removed()
+                    .await
+                    .error("Couldn't create stream")?;
+                loop {
+                    select! {
+                        rem = device_removed.next() => {
+                            let rem = rem.error("stream ended unexpectedly")?;
+                            let args = rem.args().error("dbus error")?;
+                            if args.id() == &dev.id {
+                                self.device = Device::try_find(&self.daemon_proxy, self.device_id.as_deref()).await?;
+                                return Ok(());
+                            }
+                        }
+                        _ = dev.wait_for_change() => {
+                            if !dev.connected().await {
+                                debug!("device became unreachable, re-searching");
+                                if let Some(dev) = Device::try_find(&self.daemon_proxy, self.device_id.as_deref()).await? {
+                                    if dev.connected().await {
+                                        debug!("selected {:?}", dev.id);
+                                        self.device = Some(dev);
+                                    }
+                                }
+                            }
+                            return Ok(())
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn get_device_info(&mut self) -> Option<DeviceInfo> {
+        let device = self.device.as_ref()?;
+        let (bat_level, charging) = device.battery().await;
+        Some(DeviceInfo {
+            connected: device.connected().await,
+            name: device.name().await,
+            notifications: device.notifications().await,
+            charging,
+            bat_level,
+        })
+    }
 }
 
 impl Device {
-    async fn new(conn: &zbus::Connection, tx: mpsc::Sender<()>, id: &str) -> Result<Self> {
-        let device_path = format!("/modules/kdeconnect/devices/{id}");
+    /// Find a device which `device_id`. Reachable devices have precedence.
+    async fn try_find(
+        daemon_proxy: &DaemonDbusProxy<'_>,
+        device_id: Option<&str>,
+    ) -> Result<Option<Self>> {
+        let Ok(mut devices) = daemon_proxy.devices().await
+        else {
+            debug!("could not get the list of managed objects");
+            return Ok(None);
+        };
+
+        debug!("all devices: {:?}", devices);
+
+        if let Some(device_id) = device_id {
+            devices.retain(|id| id != device_id);
+        }
+
+        let mut selected_device = None;
+
+        for id in devices {
+            let device_proxy = DeviceDbusProxy::builder(daemon_proxy.connection())
+                .cache_properties(zbus::CacheProperties::No)
+                .path(format!("/modules/kdeconnect/devices/{id}"))
+                .unwrap()
+                .build()
+                .await
+                .error("Failed to create DeviceDbusProxy")?;
+            let reachable = device_proxy.is_reachable().await.unwrap_or(false);
+            selected_device = Some((id, device_proxy));
+            if reachable {
+                break;
+            }
+        }
+
+        let Some((device_id, device_proxy)) = selected_device
+        else {
+            debug!("No device found");
+            return Ok(None);
+        };
+
+        let device_path = format!("/modules/kdeconnect/devices/{device_id}");
         let battery_path = format!("{device_path}/battery");
         let notifications_path = format!("{device_path}/notifications");
 
-        let device_proxy = DeviceDbusProxy::builder(conn)
-            .cache_properties(zbus::CacheProperties::No)
-            .path(device_path)
-            .error("Failed to set device path")?
-            .build()
-            .await
-            .error("Failed to create DeviceDbusProxy")?;
-        let battery_proxy = BatteryDbusProxy::builder(conn)
+        let battery_proxy = BatteryDbusProxy::builder(daemon_proxy.connection())
             .cache_properties(zbus::CacheProperties::No)
             .path(battery_path)
             .error("Failed to set battery path")?
             .build()
             .await
             .error("Failed to create BatteryDbusProxy")?;
-        let notifications_proxy = NotificationsDbusProxy::builder(conn)
+        let notifications_proxy = NotificationsDbusProxy::builder(daemon_proxy.connection())
             .cache_properties(zbus::CacheProperties::No)
             .path(notifications_path)
-            .error("Failed to set battery path")?
+            .error("Failed to set notifications path")?
             .build()
             .await
-            .error("Failed to create BatteryDbusProxy")?;
+            .error("Failed to create NotificationsDbusProxy")?;
 
-        let mut s1 = device_proxy
+        let device_signals = device_proxy
             .receive_all_signals()
             .await
             .error("Failed to receive signals")?;
-        let mut s2 = battery_proxy
+        let notifications_signals = notifications_proxy
+            .receive_all_signals()
+            .await
+            .error("Failed to receive signals")?;
+        let battery_refreshed = battery_proxy
             .receive_refreshed()
             .await
             .error("Failed to receive signals")?;
-        let mut s3 = notifications_proxy
-            .receive_all_signals()
-            .await
-            .error("Failed to receive signals")?;
 
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = s1.next() => tx.send(()).await.unwrap(),
-                    _ = s2.next() => tx.send(()).await.unwrap(),
-                    _ = s3.next() => tx.send(()).await.unwrap(),
-                }
-            }
-        });
-
-        Ok(Self {
+        Ok(Some(Self {
+            id: device_id,
             device_proxy,
             battery_proxy,
             notifications_proxy,
-        })
+            device_signals,
+            notifications_signals,
+            battery_refreshed,
+        }))
+    }
+
+    async fn wait_for_change(&mut self) {
+        select! {
+            _ = self.device_signals.next() => (),
+            _ = self.notifications_signals.next() => (),
+            _ = self.battery_refreshed.next() => (),
+        }
     }
 
     async fn connected(&self) -> bool {
@@ -249,25 +371,13 @@ impl Device {
         )
     }
 
-    async fn notifications(&self) -> Option<usize> {
+    async fn notifications(&self) -> usize {
         self.notifications_proxy
             .active_notifications()
             .await
             .map(|n| n.len())
-            .ok()
+            .unwrap_or(0)
     }
-}
-
-async fn any_device_id(conn: &zbus::Connection) -> Result<String> {
-    DaemonDbusProxy::new(conn)
-        .await
-        .error("Failed to create DaemonDbusProxy")?
-        .devices()
-        .await
-        .error("Failed to get devices")?
-        .into_iter()
-        .next()
-        .error("No devices found")
 }
 
 #[dbus_proxy(
@@ -278,6 +388,12 @@ async fn any_device_id(conn: &zbus::Connection) -> Result<String> {
 trait DaemonDbus {
     #[dbus_proxy(name = "devices")]
     fn devices(&self) -> zbus::Result<Vec<String>>;
+
+    #[dbus_proxy(signal, name = "deviceAdded")]
+    fn device_added(&self, id: String) -> zbus::Result<()>;
+
+    #[dbus_proxy(signal, name = "deviceRemoved")]
+    fn device_removed(&self, id: String) -> zbus::Result<()>;
 }
 
 #[dbus_proxy(
